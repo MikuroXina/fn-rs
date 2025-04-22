@@ -1,6 +1,10 @@
 use std::ops::ControlFlow;
 
-use crate::{hkt::Hkt1, type_class::Monad};
+use crate::{
+    func::{Func, func},
+    hkt::Hkt1,
+    type_class::Monad,
+};
 
 #[derive(Debug, Default)]
 pub struct Cat<T>(pub T);
@@ -23,6 +27,20 @@ impl<T> Cat<T> {
     pub fn value(self) -> T {
         self.0
     }
+
+    pub fn as_ref(&self) -> Cat<&T> {
+        Cat(&self.0)
+    }
+
+    pub fn as_mut(&mut self) -> Cat<&mut T> {
+        Cat(&mut self.0)
+    }
+}
+
+pub struct CatHkt;
+
+impl Hkt1 for CatHkt {
+    type F<T1> = Cat<T1>;
 }
 
 pub struct CatT<M: Hkt1, CTX>(M::F<CTX>);
@@ -48,40 +66,45 @@ impl<M: Monad, CTX> CatT<M, CTX> {
         Self(M::pure(ctx))
     }
 
-    pub fn add_m<A, B, F: Fn(A, CTX) -> B>(self, value: M::F<A>, mapper: F) -> CatT<M, B>
+    pub fn add_m<A: 'static, B: 'static>(
+        self,
+        value: M::F<A>,
+        mapper: Func<(A, CTX), B>,
+    ) -> CatT<M, B>
     where
         M::F<A>: Clone,
         CTX: Clone,
     {
-        CatT(M::flat_map(|ctx: CTX| -> M::F<B> {
-            M::map(|v: A| -> B { mapper(v, ctx.clone()) })(value.clone())
-        })(self.0))
+        CatT(M::flat_map(func(move |ctx: CTX| -> M::F<B> {
+            let mapper = mapper.clone();
+            M::map(func(move |v: A| -> B { (mapper)((v, ctx.clone())) }))(value.clone())
+        }))(self.0))
     }
 
-    pub fn add_with<A, B, V: Fn(CTX) -> A, F: Fn(A, CTX) -> B>(
+    pub fn add_with<A: 'static, B: 'static>(
         self,
-        value: V,
-        mapper: F,
+        value: Func<CTX, A>,
+        mapper: Func<(A, CTX), B>,
     ) -> CatT<M, B>
     where
         CTX: Clone,
     {
-        CatT(M::map(|ctx: CTX| mapper(value(ctx.clone()), ctx.clone()))(
-            self.0,
-        ))
+        CatT(M::map(func(move |ctx: CTX| {
+            (mapper)((value(ctx.clone()), ctx))
+        }))(self.0))
     }
 
-    pub fn add_m_with<A, B, V: Fn(CTX) -> M::F<A>, F: Fn(A, CTX) -> B>(
+    pub fn add_m_with<A: 'static, B: 'static>(
         self,
-        value: V,
-        mapper: F,
+        value: Func<CTX, M::F<A>>,
+        mapper: Func<(A, CTX), B>,
     ) -> CatT<M, B>
     where
         CTX: Clone,
     {
-        CatT(M::flat_map(|ctx: CTX| -> M::F<B> {
-            M::map(|v: A| -> B { mapper(v, ctx.clone()) })(value(ctx.clone()))
-        })(self.0))
+        CatT(M::flat_map(func(|ctx: CTX| -> M::F<B> {
+            M::map(func(|v: A| -> B { (mapper)((v, ctx.clone())) }))(value(ctx.clone()))
+        }))(self.0))
     }
 
     pub fn run(self, computation: M::F<()>) -> Self
@@ -89,46 +112,44 @@ impl<M: Monad, CTX> CatT<M, CTX> {
         M::F<()>: Clone,
         CTX: Clone,
     {
-        Self(M::flat_map(|ctx: CTX| -> M::F<CTX> {
-            M::map(|_| ctx.clone())(computation.clone())
-        })(self.0))
+        Self(M::flat_map(func(|ctx: CTX| -> M::F<CTX> {
+            M::map(func(|_| ctx.clone()))(computation.clone())
+        }))(self.0))
     }
 
-    pub fn run_with<C: Fn(CTX) -> M::F<()>>(self, computation: C) -> Self
+    pub fn run_with<C>(self, computation: Func<CTX, M::F<()>>) -> Self
     where
-        CTX: Clone,
+        M::F<()>: 'static,
+        CTX: Clone + 'static,
     {
-        Self(M::flat_map(|ctx: CTX| -> M::F<CTX> {
-            M::map(|_| ctx.clone())(computation(ctx.clone()))
-        })(self.0))
+        Self(M::flat_map(func(|ctx: CTX| -> M::F<CTX> {
+            M::map(func(|_| ctx.clone()))(computation(ctx.clone()))
+        }))(self.0))
     }
 
-    pub fn when<B: Fn(CTX) -> bool, C: Fn(CTX) -> M::F<()>>(self, cond: B, computation: C) -> Self
+    pub fn when(self, cond: Func<CTX, bool>, computation: Func<CTX, M::F<()>>) -> Self
     where
-        CTX: Clone,
+        M::F<()>: 'static,
+        CTX: Clone + 'static,
     {
-        Self(M::flat_map(|ctx: CTX| -> M::F<CTX> {
-            M::map(|_| ctx.clone())(if cond(ctx.clone()) {
+        Self(M::flat_map(func(|ctx: CTX| -> M::F<CTX> {
+            M::map(func(|_| ctx.clone()))(if cond(ctx.clone()) {
                 computation(ctx.clone())
             } else {
                 M::pure(())
             })
-        })(self.0))
+        }))(self.0))
     }
 
-    pub fn unfold<S, B: Fn(S, CTX) -> M::F<ControlFlow<(), S>>>(
-        self,
-        init_state: S,
-        body: B,
-    ) -> Self
+    pub fn unfold<S>(self, init_state: S, body: Func<(S, CTX), M::F<ControlFlow<(), S>>>) -> Self
     where
         S: Clone,
         CTX: Clone,
         M::F<CTX>: Clone,
     {
-        fn inner<M: Monad, CTX, S, B: Fn(S, CTX) -> M::F<ControlFlow<(), S>>>(
+        fn inner<M: Monad, CTX, S>(
             f_ctx: M::F<CTX>,
-            body: &B,
+            body: Func<(S, CTX), M::F<ControlFlow<(), S>>>,
             state: S,
         ) -> M::F<CTX>
         where
@@ -136,53 +157,71 @@ impl<M: Monad, CTX> CatT<M, CTX> {
             CTX: Clone,
             M::F<CTX>: Clone,
         {
-            M::flat_map(|ctx: CTX| -> M::F<CTX> {
-                M::flat_map(|flow: ControlFlow<(), S>| -> M::F<CTX> {
+            let cloned_f_ctx = f_ctx.clone();
+            M::flat_map(func(move |ctx: CTX| -> M::F<CTX> {
+                let cloned_ctx = ctx.clone();
+                let cloned_f_ctx = cloned_f_ctx.clone();
+                let cloned_body = body.clone();
+                M::flat_map(func(move |flow: ControlFlow<(), S>| -> M::F<CTX> {
                     if let ControlFlow::Continue(state) = flow {
-                        inner::<M, CTX, S, B>(f_ctx.clone(), body, state)
+                        inner::<M, CTX, S>(cloned_f_ctx.clone(), cloned_body.clone(), state)
                     } else {
-                        M::pure(ctx.clone())
+                        M::pure(cloned_ctx.clone())
                     }
-                })(body(state.clone(), ctx.clone()))
-            })(f_ctx.clone())
+                }))(body((state.clone(), ctx)))
+            }))(f_ctx)
         }
-        CatT(inner::<M, CTX, S, B>(self.0, &body, init_state))
+        CatT(inner::<M, CTX, S>(self.0, body, init_state))
     }
 
-    pub fn iterate<C: Fn(CTX) -> M::F<bool>, B: Fn(CTX) -> M::F<()>>(self, cond: C, body: B) -> Self
+    pub fn iterate(self, cond: Func<CTX, M::F<bool>>, body: Func<CTX, M::F<()>>) -> Self
     where
         CTX: Clone,
         M::F<CTX>: Clone,
     {
-        fn inner<M: Monad, CTX, C: Fn(CTX) -> M::F<bool>, B: Fn(CTX) -> M::F<()>>(
+        fn inner<M: Monad, CTX>(
             f_ctx: M::F<CTX>,
-            cond: &C,
-            body: &B,
+            cond: Func<CTX, M::F<bool>>,
+            body: Func<CTX, M::F<()>>,
         ) -> M::F<CTX>
         where
             CTX: Clone,
             M::F<CTX>: Clone,
         {
-            M::flat_map(|c: CTX| -> M::F<CTX> {
-                M::flat_map(|b: bool| {
+            let cloned_f_ctx = f_ctx.clone();
+            M::flat_map(func(move |ctx: CTX| -> M::F<CTX> {
+                let cloned_ctx = ctx.clone();
+                let cloned_f_ctx = cloned_f_ctx.clone();
+                let cloned_cond = cond.clone();
+                let cloned_body = body.clone();
+                M::flat_map(func(move |b: bool| {
                     if b {
-                        M::flat_map(|_: ()| inner::<M, CTX, C, B>(f_ctx.clone(), cond, body))(body(
-                            c.clone(),
-                        ))
+                        let cloned_f_ctx = cloned_f_ctx.clone();
+                        let cloned_cond = cloned_cond.clone();
+                        let cloned_cloned_body = cloned_body.clone();
+                        M::flat_map(func({
+                            move |_: ()| {
+                                inner::<M, CTX>(
+                                    cloned_f_ctx.clone(),
+                                    cloned_cond.clone(),
+                                    cloned_cloned_body.clone(),
+                                )
+                            }
+                        }))(cloned_body(cloned_ctx.clone()))
                     } else {
-                        M::pure(c.clone())
+                        M::pure(cloned_ctx.clone())
                     }
-                })(cond(c.clone()))
-            })(f_ctx.clone())
+                }))(cond(ctx.clone()))
+            }))(f_ctx.clone())
         }
-        CatT(inner::<M, CTX, C, B>(self.0, &cond, &body))
+        CatT(inner::<M, CTX>(self.0, cond, body))
     }
 
-    pub fn finish<R, F: Fn(CTX) -> R>(self, mapper: F) -> M::F<R> {
+    pub fn finish<R>(self, mapper: Func<CTX, R>) -> M::F<R> {
         M::map(mapper)(self.0)
     }
 
-    pub fn finish_m<R, F: Fn(CTX) -> M::F<R>>(self, mapper: F) -> M::F<R> {
+    pub fn finish_m<R>(self, mapper: Func<CTX, M::F<R>>) -> M::F<R> {
         M::flat_map(mapper)(self.0)
     }
 }
