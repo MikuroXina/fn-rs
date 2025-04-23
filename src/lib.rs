@@ -1,4 +1,5 @@
 pub mod cat;
+pub mod compose;
 pub mod func;
 pub mod hkt;
 pub mod identity;
